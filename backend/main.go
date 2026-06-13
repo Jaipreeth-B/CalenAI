@@ -109,6 +109,12 @@ func createTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// If start is provided but end is missing, default to 1 hour duration
+	if task.StartDateTime != nil && task.EndDateTime == nil {
+		d := (*task.StartDateTime).Add(1 * time.Hour)
+		task.EndDateTime = &d
+	}
+
 	db.Create(&task)
 	c.JSON(http.StatusCreated, task)
 }
@@ -295,7 +301,7 @@ func callOllamaWithTools(messages []OllamaMessage) (string, error) {
 	}
 
 	payload := map[string]interface{}{
-		"model":    "qwen3.5:9b",
+		"model":    "gemma4:12b",
 		"messages": messages,
 		"tools":    tools,
 		"stream":   false,
@@ -363,16 +369,25 @@ func executeTool(tc OllamaToolCall) string {
 
 		task := Task{Title: title, Desc: desc, StartDateTime: &tStart}
 
-		// Handle End Date Time
+		// Handle End Date Time: parse if provided, otherwise default to +1 hour
 		if endStr, ok := tc.Function.Arguments["end_date_time"].(string); ok && endStr != "" {
 			tEnd, err := parseFlexibleDate(endStr)
 			if err == nil {
 				task.EndDateTime = &tEnd
 			}
+		} else {
+			// default duration: 1 hour
+			tDefault := tStart.Add(1 * time.Hour)
+			task.EndDateTime = &tDefault
 		}
 
 		db.Create(&task)
-		return fmt.Sprintf("Task '%s' added successfully for %s.", title, tStart.Format("Jan 02, 15:04"))
+		// Always show both start and end time
+		endStr := ""
+		if task.EndDateTime != nil {
+			endStr = task.EndDateTime.Format("Jan 02, 15:04")
+		}
+		return fmt.Sprintf("Task '%s' added successfully for %s - %s.", title, tStart.Format("Jan 02, 15:04"), endStr)
 	case "get_tasks":
 		var tasks []Task
 		db.Find(&tasks)
