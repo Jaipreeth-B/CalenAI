@@ -20,10 +20,10 @@ import (
 
 type Task struct {
 	ID            uint           `gorm:"primaryKey" json:"id"`
-	Title         string         `json:"title"`
+	Title         string         `gorm:"collate:NOCASE;uniqueIndex:idx_task_unique" json:"title"`
 	Desc          string         `json:"desc"`
 	IsCompleted   bool           `json:"is_completed"`
-	StartDateTime *time.Time     `json:"start_date_time"`
+	StartDateTime *time.Time     `gorm:"uniqueIndex:idx_task_unique" json:"start_date_time"`
 	EndDateTime   *time.Time     `json:"end_date_time"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
