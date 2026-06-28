@@ -202,13 +202,25 @@ func handleChat(c *gin.Context) {
 	systemPrompt := fmt.Sprintf(
 		"You are CalenAI, a sophisticated minimalist assistant. "+
 			"Current Date/Time: %s (%s). "+
-			"You MUST resolve relative dates (e.g., 'next Tuesday', 'tomorrow', 'in two weeks') YOURSELF using the Current Date provided above. DO NOT ask the user to provide dates you can calculate. "+
-			"For example, if today is Tuesday, Jun 02, 'next Tuesday' is Jun 09. "+
-			"If a user mentions an event without a date (e.g., 'my dentist appointment'), use 'get_tasks' to see if it exists in their schedule. "+
-			"NEVER assume a time (hour/minute) if missing, but ALWAYS calculate the date yourself. "+
-			"For recurring tasks, call 'add_task' once for each specific date. "+
-			"Keep responses brief and focus on the action.",
-		time.Now().Format("Monday, January 02, 2006"), time.Now().Format("15:04"),
+
+			"You MUST resolve relative dates (e.g., 'tomorrow', 'next Tuesday', 'in two weeks') using the current date. Do NOT ask the user for dates you can calculate. "+
+			"If the user does not explicitly specify a time, NEVER call the add_task tool.Instead, ask the user what time they want.Do not invent, estimate, or infer a time under any circumstances.Only infer relative dates (e.g. tomorrow, next Tuesday). "+
+			"For recurring tasks, call 'add_task' once for each occurrence. "+
+
+			"Tool usage rules: "+
+			"Use 'find_tasks' whenever the user wants to search, locate, inspect, or refer to existing tasks. "+
+			"Use 'count_tasks' whenever the user asks how many tasks match certain conditions. "+
+			"Use 'delete_tasks' whenever multiple tasks matching filters should be removed. "+
+			"Use 'delete_task' only when deleting a single task identified by its ID or one uniquely identifiable task. "+
+			"Prefer specialized tools (find_tasks, count_tasks, delete_tasks) over 'get_tasks' whenever possible. "+
+			"Use 'get_tasks' only when a complete task list is genuinely required. "+
+
+			"If a user refers to an existing task without specifying an ID or exact date (e.g., 'my dentist appointment' or 'my GRE task'), first use 'find_tasks' to locate matching tasks. "+
+			"When updating an existing task that is not identified by ID, first use 'find_tasks', then use 'update_task'. "+
+
+			"Keep responses brief and action-oriented.",
+		time.Now().Format("Monday, January 02, 2006"),
+		time.Now().Format("15:04"),
 	)
 
 	var messages []OllamaMessage
@@ -218,7 +230,7 @@ func handleChat(c *gin.Context) {
 	}
 
 	// 2. Reasoning Loop (Multi-Think)
-	response, err := callOllamaWithTools(messages)
+	response, err := callOllamaWithTools(messages, 0)
 	if err != nil {
 		log.Printf("Ollama error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "AI failure"})
@@ -231,33 +243,123 @@ func handleChat(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"response": response})
 }
 
-func callOllamaWithTools(messages []OllamaMessage) (string, error) {
-	ollamaURL := "http://localhost:11434/api/chat"
+const maxToolCalls = 10
 
+func callOllamaWithTools(messages []OllamaMessage, depth int) (string, error) {
+	ollamaURL := "http://localhost:11434/api/chat"
+	if depth >= maxToolCalls {
+		return "", fmt.Errorf("agent exceeded maximum tool calls (%d)", maxToolCalls)
+	}
 	tools := []map[string]interface{}{
 		{
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        "add_task",
-				"description": "Add a SINGLE task or event. For recurring tasks, call this tool multiple times. Example format: '2026-06-02T17:00:00'.",
+				"description": "Add a SINGLE task or calendar event. For recurring tasks, call this tool once for each occurrence. If the user specifies an end time or duration, include end_date_time. Otherwise omit it; the backend will automatically default the event duration to 1 hour.",
 				"parameters": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"title":           map[string]interface{}{"type": "string"},
-						"desc":            map[string]interface{}{"type": "string"},
-						"start_date_time": map[string]interface{}{"type": "string", "description": "ISO8601 format (e.g., 2026-06-02T17:00:00)."},
-						"end_date_time":   map[string]interface{}{"type": "string", "description": "ISO8601 format (e.g., 2026-06-02T18:00:00)."},
+						"title": map[string]interface{}{
+							"type": "string",
+						},
+						"desc": map[string]interface{}{
+							"type": "string",
+						},
+						"start_date_time": map[string]interface{}{
+							"type":        "string",
+							"description": "Required. ISO8601 format (e.g., 2026-06-02T17:00:00).",
+						},
+						"end_date_time": map[string]interface{}{
+							"type":        "string",
+							"description": "Optional. ISO8601 format (e.g., 2026-06-02T18:00:00). Provide only if the user explicitly specifies an end time or duration. Otherwise omit this field.",
+						},
 					},
 					"required": []string{"title", "start_date_time"},
 				},
 			},
 		},
+
 		{
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        "get_tasks",
 				"description": "Retrieve all tasks and events to see current schedule and task IDs.",
 				"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "find_tasks",
+				"description": "Find tasks matching the provided filters.",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"title_contains": map[string]interface{}{
+							"type":        "string",
+							"description": "Find tasks whose title contains this text.",
+						},
+						"start_date": map[string]interface{}{
+							"type":        "string",
+							"description": "Start of date range (YYYY-MM-DD).",
+						},
+						"end_date": map[string]interface{}{
+							"type":        "string",
+							"description": "End of date range (YYYY-MM-DD).",
+						},
+						"completed": map[string]interface{}{
+							"type": "boolean",
+						},
+					},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "count_tasks",
+				"description": "Count tasks matching the provided filters.",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"title_contains": map[string]interface{}{
+							"type": "string",
+						},
+						"start_date": map[string]interface{}{
+							"type": "string",
+						},
+						"end_date": map[string]interface{}{
+							"type": "string",
+						},
+						"completed": map[string]interface{}{
+							"type": "boolean",
+						},
+					},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "delete_tasks",
+				"description": "Delete all tasks matching the provided filters.",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"title_contains": map[string]interface{}{
+							"type": "string",
+						},
+						"start_date": map[string]interface{}{
+							"type": "string",
+						},
+						"end_date": map[string]interface{}{
+							"type": "string",
+						},
+						"completed": map[string]interface{}{
+							"type": "boolean",
+						},
+					},
+				},
 			},
 		},
 		{
@@ -312,16 +414,27 @@ func callOllamaWithTools(messages []OllamaMessage) (string, error) {
 	var ollamaResp struct {
 		Message OllamaMessage `json:"message"`
 	}
-	json.Unmarshal(body, &ollamaResp)
+	if err := json.Unmarshal(body, &ollamaResp); err != nil {
+		return "", fmt.Errorf("failed to parse Ollama response: %w", err)
+	}
 
 	if len(ollamaResp.Message.ToolCalls) > 0 {
+
+		messages = append(messages, ollamaResp.Message)
+
 		for _, tc := range ollamaResp.Message.ToolCalls {
 			log.Printf("AI thinking... Executing tool: %s", tc.Function.Name)
+			log.Printf("Tool arguments: %+v", tc.Function.Arguments)
+			log.Printf("Reasoning depth: %d", depth)
 			res := executeTool(tc)
-			messages = append(messages, ollamaResp.Message)
-			messages = append(messages, OllamaMessage{Role: "tool", Content: res})
+			log.Printf("Tool result: %s", res)
+			messages = append(messages, OllamaMessage{
+				Role:    "tool",
+				Content: res,
+			})
 		}
-		return callOllamaWithTools(messages)
+
+		return callOllamaWithTools(messages, depth+1)
 	}
 
 	return ollamaResp.Message.Content, nil
@@ -344,7 +457,30 @@ func parseFlexibleDate(s string) (time.Time, error) {
 	}
 	return time.Time{}, fmt.Errorf("invalid date format")
 }
+func applyTaskFilters(query *gorm.DB, args map[string]interface{}) *gorm.DB {
 
+	// Filter by title
+	if title, ok := args["title_contains"].(string); ok && title != "" {
+		query = query.Where("title LIKE ?", "%"+title+"%")
+	}
+
+	// Filter by completion status
+	if completed, ok := args["completed"].(bool); ok {
+		query = query.Where("is_completed = ?", completed)
+	}
+
+	// Filter by start date
+	if startDate, ok := args["start_date"].(string); ok && startDate != "" {
+		query = query.Where("date(start_date_time) >= date(?)", startDate)
+	}
+
+	// Filter by end date
+	if endDate, ok := args["end_date"].(string); ok && endDate != "" {
+		query = query.Where("date(start_date_time) <= date(?)", endDate)
+	}
+
+	return query
+}
 func executeTool(tc OllamaToolCall) string {
 	switch tc.Function.Name {
 	case "add_task":
@@ -361,9 +497,13 @@ func executeTool(tc OllamaToolCall) string {
 			return "Error: Invalid start date format. Please use ISO8601 (e.g., 2026-06-02T17:00:00)."
 		}
 
-		task := Task{Title: title, Desc: desc, StartDateTime: &tStart}
+		task := Task{
+			Title:         title,
+			Desc:          desc,
+			StartDateTime: &tStart,
+		}
 
-		// Handle End Date Time
+		// Use AI-provided end time if available.
 		if endStr, ok := tc.Function.Arguments["end_date_time"].(string); ok && endStr != "" {
 			tEnd, err := parseFlexibleDate(endStr)
 			if err == nil {
@@ -371,13 +511,40 @@ func executeTool(tc OllamaToolCall) string {
 			}
 		}
 
-		db.Create(&task)
+		// Otherwise default to 1 hour after the start time.
+		if task.EndDateTime == nil {
+			defaultEnd := tStart.Add(time.Hour)
+			task.EndDateTime = &defaultEnd
+		}
+
+		if err := db.Create(&task).Error; err != nil {
+			return fmt.Sprintf("Failed to create task: %v", err)
+		}
 		return fmt.Sprintf("Task '%s' added successfully for %s.", title, tStart.Format("Jan 02, 15:04"))
+	case "find_tasks":
+		query := applyTaskFilters(db.Model(&Task{}), tc.Function.Arguments)
+
+		var tasks []Task
+		query.Find(&tasks)
+
+		data, err := json.Marshal(tasks)
+		if err != nil {
+			return "Error: Failed to serialize tasks."
+		}
+
+		return string(data)
 	case "get_tasks":
 		var tasks []Task
 		db.Find(&tasks)
 		data, _ := json.Marshal(tasks)
 		return string(data)
+	case "count_tasks":
+		query := applyTaskFilters(db.Model(&Task{}), tc.Function.Arguments)
+
+		var count int64
+		query.Count(&count)
+
+		return fmt.Sprintf("%d", count)
 	case "update_task":
 		idFloat, _ := tc.Function.Arguments["id"].(float64)
 		id := uint(idFloat)
@@ -396,12 +563,24 @@ func executeTool(tc OllamaToolCall) string {
 			task.IsCompleted = completed
 		}
 		if startStr, ok := tc.Function.Arguments["start_date_time"].(string); ok {
-			t, _ := time.Parse(time.RFC3339, startStr)
-			task.StartDateTime = &t
+			t, err := parseFlexibleDate(startStr)
+			if err == nil {
+				task.StartDateTime = &t
+			}
 		}
 
 		db.Save(&task)
 		return "Task updated successfully."
+	case "delete_tasks":
+		query := applyTaskFilters(db.Model(&Task{}), tc.Function.Arguments)
+
+		result := query.Delete(&Task{})
+
+		if result.Error != nil {
+			return fmt.Sprintf("Error deleting tasks: %v", result.Error)
+		}
+
+		return fmt.Sprintf("Successfully deleted %d task(s).", result.RowsAffected)
 	case "delete_task":
 		idFloat, _ := tc.Function.Arguments["id"].(float64)
 		id := uint(idFloat)
